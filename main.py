@@ -127,6 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="User prompt for formatting (optional). If omitted, you can enter it before recording.",
     )
     parser.add_argument(
+        "--ask-prompt",
+        action="store_true",
+        help="Ask for formatting prompt interactively before recording starts.",
+    )
+    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="List available input devices and exit.",
@@ -225,6 +230,50 @@ def _get_device_display_name(device: Optional[int | str]) -> str:
                 return d["name"][:36] + ("..." if len(d["name"]) > 36 else "")
         return f"Device {device}"
     return str(device)[:40]
+
+
+def _auto_select_working_input_device(
+    *,
+    current_device: Optional[int | str],
+    console: Optional[Console],
+    per_device_test_sec: float = 0.8,
+    max_probe_devices: int = 10,
+) -> Optional[int]:
+    """Probe input devices briefly and return a device index with strongest signal."""
+    if current_device is not None:
+        return None
+    try:
+        devices = list_input_devices()
+    except AudioCaptureError:
+        return None
+    if not devices:
+        return None
+
+    best_idx: Optional[int] = None
+    best_peak = 0.0
+    tested = 0
+    for dev in devices:
+        if tested >= max_probe_devices:
+            break
+        idx = int(dev.get("index", -1))
+        if idx < 0:
+            continue
+        tested += 1
+        tester = AudioCapture(device=idx, include_system_audio=False)
+        try:
+            diag = tester.run_self_test(per_device_test_sec)
+        except Exception:
+            continue
+        if diag.peak_level > best_peak:
+            best_peak = float(diag.peak_level)
+            best_idx = idx
+        if diag.has_signal and diag.peak_level >= 0.01:
+            return idx
+
+    if best_idx is not None and best_peak >= 0.003:
+        _print(console, f"入力があるデバイス候補を検出: device={best_idx}", "yellow")
+        return best_idx
+    return None
 
 
 def _build_header_panel(mode: str, device_name: str, model_size: str):
@@ -398,9 +447,9 @@ def run(args: argparse.Namespace) -> int:
     if args.list_devices:
         return show_devices(console)
 
-    # Prompt input (before recording). MVP: keep it optional and simple.
+    # Prompt input (before recording). By default, skip interactive prompt for quick start.
     prompt: Optional[str] = (args.prompt or "").strip() or None
-    if prompt is None and sys.stdin is not None and sys.stdin.isatty():
+    if args.ask_prompt and prompt is None and sys.stdin is not None and sys.stdin.isatty():
         _print(console, "整形プロンプトを入力してください（空でスキップ）。複数行OK、空行で確定。", "bold cyan")
         lines: list[str] = []
         while True:
@@ -478,6 +527,12 @@ def run(args: argparse.Namespace) -> int:
     # Input self-test (before starting capture) for UX-friendly feedback.
     try:
         diag = capture.run_self_test(2.5)
+        if not diag.has_signal and device is None:
+            auto_device = _auto_select_working_input_device(current_device=device, console=console)
+            if auto_device is not None:
+                device = auto_device
+                capture = AudioCapture(device=device)
+                diag = capture.run_self_test(1.6)
         # Prefer actual device name from capture/PortAudio over device list label.
         device_name = diag.device_name or device_name
         if use_live:

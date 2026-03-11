@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional
 
-from app.recording_session import RecordingSession
+from app.recording_session import RecordingSession, get_input_devices
 
 
 MODES = ("raw", "clean", "cursor", "minutes")
@@ -38,6 +38,7 @@ class PromptVoiceApp:
         self._emotion_frames = ["🎧", "🎙", "✨", "🎧"]
         self._emotion_index = 0
         self._is_transcribing = False
+        self._device_choices: dict[str, Optional[str]] = {}
 
         self._build_ui()
         self._poll_queue()
@@ -97,7 +98,17 @@ class PromptVoiceApp:
             row1, textvariable=self._mode_var, values=MODES, state="readonly", width=8
         )
         mode_combo.pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Label(row1, text="入力: 自動（マイク + 内部音）", foreground="#555").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(row1, text="入力:", foreground="#555").pack(side=tk.LEFT, padx=(0, 4))
+        self._device_var = tk.StringVar(value="自動（既定デバイス）")
+        self._device_combo = ttk.Combobox(
+            row1,
+            textvariable=self._device_var,
+            values=("自動（既定デバイス）",),
+            state="readonly",
+            width=28,
+        )
+        self._device_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self._refresh_device_options()
 
         self._copy_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="確定時にコピー", variable=self._copy_var).pack(side=tk.LEFT, padx=(8, 0))
@@ -163,10 +174,12 @@ class PromptVoiceApp:
         auto_paste = self._autopaste_var.get()
         show_partial = self._partial_var.get()
         initial_prompt = self._prompt_text.get("1.0", tk.END).strip() or None
+        device = self._resolve_selected_device()
 
         self._session = RecordingSession(
             self._event_queue,
             mode=mode,
+            device=device,
             no_copy=no_copy,
             auto_paste=auto_paste,
             history_path=HISTORY_PATH,
@@ -179,6 +192,30 @@ class PromptVoiceApp:
         self._record_btn.config(text="⏹ 停止", bg="#dc3545")
         self._record_btn.bind("<Leave>", lambda e: None)  # 録音中はホバーで色を戻さない
         self._set_status("🎧", "録音中… 話し終わったら「停止」を押してください")
+
+    def _refresh_device_options(self) -> None:
+        choices: list[str] = ["自動（既定デバイス）"]
+        mapping: dict[str, Optional[str]] = {choices[0]: None}
+        for dev in get_input_devices():
+            idx = dev.get("index")
+            name = str(dev.get("name", "")).strip() or "Unknown device"
+            label = f"[{idx}] {name}"
+            mapping[label] = str(idx)
+            choices.append(label)
+        self._device_choices = mapping
+        self._device_combo["values"] = tuple(choices)
+        if self._device_var.get() not in self._device_choices:
+            self._device_var.set(choices[0])
+
+    def _resolve_selected_device(self) -> Optional[str]:
+        selected = (self._device_var.get() or "").strip()
+        if selected in self._device_choices:
+            return self._device_choices[selected]
+        if selected.startswith("[") and "]" in selected:
+            idx = selected[1:selected.index("]")].strip()
+            if idx:
+                return idx
+        return None
 
     def _copy_final(self) -> None:
         text = self._final_text.get("1.0", tk.END).strip()

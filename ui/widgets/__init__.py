@@ -5,6 +5,9 @@ from .status_panel import StatusPanel
 from .mode_panel import ModePanel
 from .transcript_panel import TranscriptPanel
 from .footer import FooterBar
+from .input_meter import InputMeter
+from .partial_panel import PartialPanel
+from .final_panel import FinalPanel
 
 __all__ = [
     "AppHeader",
@@ -12,4 +15,7 @@ __all__ = [
     "ModePanel",
     "TranscriptPanel",
     "FooterBar",
+    "InputMeter",
+    "PartialPanel",
+    "FinalPanel",
 ]

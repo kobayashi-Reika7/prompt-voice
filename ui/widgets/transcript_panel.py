@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from textual.widgets import Static
-from textual.containers import VerticalScroll
 from textual.app import ComposeResult
 
 

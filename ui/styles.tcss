@@ -1,41 +1,80 @@
-/* Optional external styles for prompt_voice TUI. App uses inline CSS for MVP. */
-
 Screen {
-  background: #111111;
-  color: #f5f5f5;
+    background: #111111;
+    color: #f5f5f5;
+}
+
+#header {
+    height: 3;
+    background: #1b1b1b;
+    color: #ffffff;
+    padding: 0 2;
+    layout: horizontal;
+}
+
+#header-title {
+    width: 1fr;
+    text-style: bold;
+}
+
+#header-mode {
+    width: 20;
+    color: #9aa0a6;
+}
+
+#header-source {
+    width: 18;
+    color: #9aa0a6;
+}
+
+#content {
+    height: 1fr;
+}
+
+#sidebar {
+    width: 30;
+    background: #161616;
+    border: round #2a2a2a;
+    padding: 1 2;
+}
+
+#main-pane {
+    padding: 1 2;
+    height: 1fr;
 }
 
 #partial-panel {
-  color: #9aa0a6;
-  border: round #2a2a2a;
-  min-height: 8;
+    height: 9;
+    margin-bottom: 1;
 }
 
 #final-panel {
-  color: #ffffff;
-  border: round #5c7cfa;
-  background: #151922;
-  min-height: 12;
-  padding: 1 2;
+    height: 1fr;
 }
 
-.status-idle {
-  color: #aaaaaa;
+#footer {
+    height: 3;
+    background: #1b1b1b;
+    color: #9aa0a6;
+    padding: 1 2;
 }
 
-.status-recording {
-  color: #ff5d73;
-  text-style: bold;
+.section-title {
+    color: #9aa0a6;
+    text-style: bold;
+    margin-bottom: 1;
 }
 
-.status-transcribing {
-  color: #ffd166;
+#status-label {
+    color: #ff5d73;
+    text-style: bold;
+    margin-bottom: 1;
 }
 
-.status-copied {
-  color: #7bd88f;
+#source-label, #mode-label, #copy-label {
+    color: #cccccc;
+    margin-bottom: 1;
 }
 
-.status-error {
-  color: #ff6b6b;
+#input-meter {
+    margin-top: 1;
 }

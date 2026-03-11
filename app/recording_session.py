@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
 from .audio_capture import AudioCapture, AudioCaptureError, list_input_devices
@@ -24,6 +25,8 @@ from .transcriber import LocalTranscriber, TranscriberError
 from .vad import VADError, create_default_detector
 
 logger = logging.getLogger(__name__)
+FALLBACK_MIN_DURATION_SEC = 0.8
+FALLBACK_MAX_DURATION_SEC = 20.0
 
 
 def _resolve_device(raw_device: Optional[str]) -> Optional[int | str]:
@@ -182,6 +185,9 @@ class RecordingSession:
         last_partial_text = ""
         last_audio_warn_ts = 0.0
         last_level_push_ts = 0.0
+        recent_chunks = deque()
+        recent_duration_sec = 0.0
+        finalized_count = 0
 
         try:
             while not self._stop_event.is_set():
@@ -215,6 +221,11 @@ class RecordingSession:
                 chunk = capture.get_chunk(timeout=0.2)
                 if chunk is None:
                     continue
+                recent_chunks.append(chunk)
+                recent_duration_sec += float(chunk.duration_sec)
+                while recent_chunks and recent_duration_sec > FALLBACK_MAX_DURATION_SEC:
+                    oldest = recent_chunks.popleft()
+                    recent_duration_sec = max(0.0, recent_duration_sec - float(oldest.duration_sec))
 
                 segment = detector.process_chunk(chunk)
 
@@ -254,6 +265,7 @@ class RecordingSession:
                         )
                         if formatted:
                             self._queue.put({"type": "final", "raw": raw, "text": formatted})
+                            finalized_count += 1
                     except Exception as exc:
                         self._queue.put({"type": "error", "message": str(exc)})
         finally:
@@ -274,13 +286,35 @@ class RecordingSession:
                         )
                         if formatted:
                             self._queue.put({"type": "final", "raw": raw, "text": formatted})
+                            finalized_count += 1
                     except Exception as exc:
                         self._queue.put({"type": "error", "message": str(exc)})
             except Exception as exc:
                 logger.warning("Flush failed: %s", exc)
-            finally:
-                capture.stop()
-                self._queue.put({"type": "stopped", "message": "録音停止"})
+            if finalized_count == 0 and recent_duration_sec >= FALLBACK_MIN_DURATION_SEC and recent_chunks:
+                # Manual stop fallback: transcribe recent buffered audio even if VAD missed speech.
+                try:
+                    fallback_segment = UtteranceSegment(chunks=list(recent_chunks))
+                    raw, formatted = _handle_final(
+                        segment=fallback_segment,
+                        transcriber=transcriber,
+                        formatter=formatter,
+                        clipboard=clipboard,
+                        history=history,
+                        mode=self._mode,
+                        no_copy=self._no_copy,
+                        auto_paste=self._auto_paste,
+                        initial_prompt=self._initial_prompt,
+                    )
+                    if formatted:
+                        self._queue.put({"type": "final", "raw": raw, "text": formatted})
+                        self._queue.put(
+                            {"type": "status", "message": "VAD未検出のため、停止時バッファから文字起こししました"}
+                        )
+                except Exception as exc:
+                    self._queue.put({"type": "error", "message": f"Fallback transcription failed: {exc}"})
+            capture.stop()
+            self._queue.put({"type": "stopped", "message": "録音停止"})
 
 
 def get_input_devices() -> list[dict[str, Any]]:
