@@ -1,0 +1,41 @@
+/* Optional external styles for prompt_voice TUI. App uses inline CSS for MVP. */
+
+Screen {
+  background: #111111;
+  color: #f5f5f5;
+}
+
+#partial-panel {
+  color: #9aa0a6;
+  border: round #2a2a2a;
+  min-height: 8;
+}
+
+#final-panel {
+  color: #ffffff;
+  border: round #5c7cfa;
+  background: #151922;
+  min-height: 12;
+  padding: 1 2;
+}
+
+.status-idle {
+  color: #aaaaaa;
+}
+
+.status-recording {
+  color: #ff5d73;
+  text-style: bold;
+}
+
+.status-transcribing {
+  color: #ffd166;
+}
+
+.status-copied {
+  color: #7bd88f;
+}
+
+.status-error {
+  color: #ff6b6b;
+}
