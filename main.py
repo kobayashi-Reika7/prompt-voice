@@ -15,10 +15,19 @@ from app.audio_capture import (
     list_input_devices,
 )
 from app.clipboard_util import ClipboardManager
-from app.config import DEFAULT_MODE, MODEL_SIZE, PARTIAL_INTERVAL_MS
+from app.config import (
+    DEFAULT_MODE,
+    ENABLE_INPUT_METER,
+    INPUT_ACTIVE_THRESHOLD,
+    MODEL_SIZE,
+    PARTIAL_MAX_AUDIO_SEC,
+    PARTIAL_MIN_AUDIO_SEC,
+    PARTIAL_UPDATE_INTERVAL_SEC,
+)
 from app.formatter import FormatterError, TextFormatter
 from app.history import HistoryStore
 from app.hotkey import HotkeyError, PushToTalkKeyState
+from app.models import UtteranceSegment
 from app.transcriber import LocalTranscriber, TranscriberError
 from app.vad import VADError, create_default_detector
 
@@ -42,11 +51,13 @@ ALLOWED_MODES = ("raw", "clean", "cursor", "minutes")
 
 
 def _source_label(source_type: str) -> str:
-    # Prepared for future: auto|mic|system selection.
+    # Auto capture can combine mic + system loopback.
     if source_type == "mic":
         return "マイク"
     if source_type == "system":
         return "システム音"
+    if source_type == "mixed":
+        return "マイク + システム音"
     return "不明"
 
 
@@ -60,11 +71,36 @@ def _diagnostic_lines(diag) -> list[str]:
     lines.append(f"入力デバイス: {diag.device_name}")
     lines.append(f"レベル: peak={diag.peak_level:.3f} / rms={diag.avg_level:.3f}")
     if not diag.has_signal:
-        lines.append("会議相手の声は通常、マイクではなくスピーカー出力です")
-        lines.append("Teams / Zoom / Meet の会議全体をまとめたい場合は、今後 system audio 対応が必要です")
+        lines.append("会議相手の声はスピーカー出力のため、出力デバイス設定も確認してください")
     if diag.note:
         lines.append(str(diag.note))
     return lines
+
+
+def _segment_tail_for_partial(segment: UtteranceSegment, *, max_audio_sec: float) -> UtteranceSegment:
+    if max_audio_sec <= 0 or segment.duration_sec <= max_audio_sec:
+        return segment
+    selected = []
+    acc = 0.0
+    for chunk in reversed(segment.chunks):
+        selected.append(chunk)
+        acc += chunk.duration_sec
+        if acc >= max_audio_sec:
+            break
+    selected.reverse()
+    if not selected:
+        return segment
+    sliced = UtteranceSegment(chunks=list(selected))
+    sliced.start_time = selected[0].timestamp
+    last = selected[-1]
+    sliced.end_time = last.timestamp + last.duration_sec
+    return sliced
+
+
+def _meter_bar(level: float, *, width: int = 16) -> str:
+    clamped = max(0.0, min(1.0, float(level)))
+    filled = int(round(clamped * width))
+    return ("█" * filled) + ("░" * max(0, width - filled))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,6 +253,11 @@ def _build_live_renderable(state: dict[str, Any], use_rich: bool) -> Any:
     icon = state.get("status_icon", "⏳")
     status = state.get("status", "Listening...")
     parts.append(Text().append(icon + " ", style="bold").append(status, style="cyan"))
+    if ENABLE_INPUT_METER:
+        meter = str(state.get("input_meter", ""))
+        if meter:
+            active = bool(state.get("input_active", False))
+            parts.append(Text("🎚 Input ", style="dim").append(meter, style="green" if active else "dim"))
     parts.append(Rule(style="dim"))
     # Partial (dim)
     partial = (state.get("partial_text") or "").strip()
@@ -411,6 +452,8 @@ def run(args: argparse.Namespace) -> int:
         "header": _build_header_panel(args.mode, device_name, MODEL_SIZE) if use_live else None,
         "status_icon": "🎙",
         "status": "Starting...",
+        "input_meter": "",
+        "input_active": False,
         "partial_text": "",
         "final_text": "",
         "copy_message": "",
@@ -459,6 +502,7 @@ def run(args: argparse.Namespace) -> int:
     last_partial_text = ""
     finalized_count = 0
     ptt_prev_pressed = not args.push_to_talk
+    last_level_ts = 0.0
 
     try:
         capture.start()
@@ -492,6 +536,19 @@ def run(args: argparse.Namespace) -> int:
                 if callback_error:
                     LOGGER.warning("Audio capture warning: %s", callback_error)
 
+                if ENABLE_INPUT_METER:
+                    now = time.time()
+                    if now - last_level_ts >= 0.12:
+                        lvl = capture.get_level()
+                        rms = float(lvl.get("rms", 0.0))
+                        peak = float(lvl.get("peak", 0.0))
+                        level = max(rms * 12.0, peak * 4.0)
+                        state["input_meter"] = f"[{_meter_bar(level)}]"
+                        state["input_active"] = bool(
+                            rms >= INPUT_ACTIVE_THRESHOLD or peak >= INPUT_ACTIVE_THRESHOLD
+                        )
+                        last_level_ts = now
+
                 ptt_pressed = True
                 if ptt_key is not None:
                     try:
@@ -519,6 +576,7 @@ def run(args: argparse.Namespace) -> int:
                                 history=history,
                                 console=None if use_live else console,
                                 mode=args.mode,
+                                prompt=prompt,
                                 no_copy=args.no_copy,
                                 auto_paste=args.auto_paste,
                                 finalized_count=finalized_count,
@@ -551,11 +609,15 @@ def run(args: argparse.Namespace) -> int:
 
                 if args.show_partial:
                     now = time.time()
-                    if now - last_partial_ts >= PARTIAL_INTERVAL_MS / 1000.0:
+                    if now - last_partial_ts >= PARTIAL_UPDATE_INTERVAL_SEC:
                         current = detector.get_current_segment()
-                        if current is not None and current.duration_sec > 0.1:
+                        if current is not None and current.duration_sec >= PARTIAL_MIN_AUDIO_SEC:
                             try:
-                                partial = transcriber.partial_transcribe(current)
+                                partial_target = _segment_tail_for_partial(
+                                    current,
+                                    max_audio_sec=PARTIAL_MAX_AUDIO_SEC,
+                                )
+                                partial = transcriber.partial_transcribe(partial_target)
                                 raw_partial_text = (partial.text if partial is not None else "").strip()
                                 if raw_partial_text and raw_partial_text != last_partial_text:
                                     formatted_partial = formatter.format_text(

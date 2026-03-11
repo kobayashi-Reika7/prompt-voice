@@ -72,5 +72,5 @@ class InputDiagnosticResult:
     avg_level: float
     peak_level: float
     device_name: str
-    source_type: Literal["mic", "system", "unknown"] = "unknown"
+    source_type: Literal["mic", "system", "mixed", "unknown"] = "unknown"
     note: Optional[str] = None

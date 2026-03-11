@@ -44,6 +44,7 @@ class VoiceController:
         on_status: Optional[Callable[[str], None]] = None,
         on_partial: Optional[Callable[[str], None]] = None,
         on_final: Optional[Callable[[str, str], None]] = None,
+        on_level: Optional[Callable[[float, bool], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
         on_stopped: Optional[Callable[[], None]] = None,
         device: Optional[str] = None,
@@ -54,6 +55,7 @@ class VoiceController:
         self._on_status = on_status
         self._on_partial = on_partial
         self._on_final = on_final
+        self._on_level = on_level
         self._on_error = on_error
         self._on_stopped = on_stopped
         self._device = device
@@ -119,6 +121,11 @@ class VoiceController:
                 text = ev.get("text", "")
                 if self._on_final:
                     self._on_final(raw, text)
+            elif t == "level":
+                if self._on_level:
+                    level = float(ev.get("level", 0.0))
+                    active = bool(ev.get("active", False))
+                    self._on_level(level, active)
             elif t == "error":
                 msg = ev.get("message", "")
                 if self._on_error:

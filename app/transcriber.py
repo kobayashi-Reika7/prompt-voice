@@ -138,10 +138,22 @@ class LocalTranscriber:
         audio, _sample_rate = self._extract_audio(_segment)
         if audio is None:
             return None
+        return self.transcribe_partial(audio, initial_prompt=initial_prompt)
+
+    def transcribe_partial(
+        self,
+        audio: np.ndarray,
+        *,
+        initial_prompt: Optional[str] = None,
+    ) -> Optional[TranscriptResult]:
+        """Fast partial transcription for in-progress speech."""
+        mono = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if mono.size < int(0.08 * SAMPLE_RATE):
+            return None
 
         try:
             segments, info = self.model.transcribe(
-                audio,
+                mono,
                 language=(self.language or "").strip() or None,
                 task="transcribe",
                 beam_size=1,

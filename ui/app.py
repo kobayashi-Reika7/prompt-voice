@@ -74,6 +74,8 @@ class PromptVoiceApp(App[None]):
     partial_text = reactive("")
     final_text = reactive("")
     last_final_for_copy = reactive("")  # last final text, used when user presses C
+    input_level = reactive(0.0)
+    signal_active = reactive(False)
 
     def __init__(
         self,
@@ -96,6 +98,7 @@ class PromptVoiceApp(App[None]):
             on_status=self._on_status,
             on_partial=self._on_partial,
             on_final=self._on_final,
+            on_level=self._on_level,
             on_error=self._on_error,
             on_stopped=self._on_stopped,
             device=self._device,
@@ -137,6 +140,19 @@ class PromptVoiceApp(App[None]):
             panel.set_final(text)
             panel.clear_partial()
             self.partial_text = ""
+        except Exception:
+            pass
+
+    def _on_level(self, level: float, active: bool) -> None:
+        self.call_from_thread(self._safe_set_level, level, active)
+
+    def _safe_set_level(self, level: float, active: bool) -> None:
+        self.input_level = max(0.0, min(1.0, float(level)))
+        self.signal_active = bool(active)
+        try:
+            status_panel = self.query_one(StatusPanel)
+            status_panel.input_level = self.input_level
+            status_panel.signal_active = self.signal_active
         except Exception:
             pass
         try:

@@ -10,9 +10,16 @@ from typing import Any, Optional
 
 from .audio_capture import AudioCapture, AudioCaptureError, list_input_devices
 from .clipboard_util import ClipboardManager
-from .config import PARTIAL_INTERVAL_MS
+from .config import (
+    ENABLE_INPUT_METER,
+    INPUT_ACTIVE_THRESHOLD,
+    PARTIAL_MAX_AUDIO_SEC,
+    PARTIAL_MIN_AUDIO_SEC,
+    PARTIAL_UPDATE_INTERVAL_SEC,
+)
 from .formatter import FormatterError, TextFormatter
 from .history import HistoryStore
+from .models import UtteranceSegment
 from .transcriber import LocalTranscriber, TranscriberError
 from .vad import VADError, create_default_detector
 
@@ -26,6 +33,29 @@ def _resolve_device(raw_device: Optional[str]) -> Optional[int | str]:
     if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
         return int(s)
     return s
+
+
+def _segment_tail_for_partial(segment: UtteranceSegment, *, max_audio_sec: float) -> UtteranceSegment:
+    """
+    Keep only the tail window for partial ASR to keep latency stable.
+    """
+    if max_audio_sec <= 0 or segment.duration_sec <= max_audio_sec:
+        return segment
+    selected = []
+    acc = 0.0
+    for chunk in reversed(segment.chunks):
+        selected.append(chunk)
+        acc += chunk.duration_sec
+        if acc >= max_audio_sec:
+            break
+    selected.reverse()
+    if not selected:
+        return segment
+    sliced = UtteranceSegment(chunks=list(selected))
+    sliced.start_time = selected[0].timestamp
+    last = selected[-1]
+    sliced.end_time = last.timestamp + last.duration_sec
+    return sliced
 
 
 def _handle_final(
@@ -146,11 +176,12 @@ class RecordingSession:
             return
 
         dev_name = capture.get_active_device_name()
-        self._queue.put({"type": "status", "message": f"録音開始（マイク入力）: {dev_name}"})
+        self._queue.put({"type": "status", "message": f"録音開始（自動入力）: {dev_name}"})
 
         last_partial_ts = 0.0
         last_partial_text = ""
         last_audio_warn_ts = 0.0
+        last_level_push_ts = 0.0
 
         try:
             while not self._stop_event.is_set():
@@ -162,6 +193,25 @@ class RecordingSession:
                         self._queue.put({"type": "status", "message": err})
                         last_audio_warn_ts = now
 
+                if ENABLE_INPUT_METER:
+                    now = time.time()
+                    if now - last_level_push_ts >= 0.12:
+                        lvl = capture.get_level()
+                        rms = float(lvl.get("rms", 0.0))
+                        peak = float(lvl.get("peak", 0.0))
+                        level = max(rms * 12.0, peak * 4.0)
+                        level = max(0.0, min(1.0, level))
+                        self._queue.put(
+                            {
+                                "type": "level",
+                                "level": level,
+                                "rms": rms,
+                                "peak": peak,
+                                "active": bool(rms >= INPUT_ACTIVE_THRESHOLD or peak >= INPUT_ACTIVE_THRESHOLD),
+                            }
+                        )
+                        last_level_push_ts = now
+
                 chunk = capture.get_chunk(timeout=0.2)
                 if chunk is None:
                     continue
@@ -170,12 +220,16 @@ class RecordingSession:
 
                 if self._show_partial:
                     now = time.time()
-                    if now - last_partial_ts >= PARTIAL_INTERVAL_MS / 1000.0:
+                    if now - last_partial_ts >= PARTIAL_UPDATE_INTERVAL_SEC:
                         current = detector.get_current_segment()
-                        if current is not None and current.duration_sec > 0.1:
+                        if current is not None and current.duration_sec >= PARTIAL_MIN_AUDIO_SEC:
                             try:
+                                partial_target = _segment_tail_for_partial(
+                                    current,
+                                    max_audio_sec=PARTIAL_MAX_AUDIO_SEC,
+                                )
                                 partial = transcriber.partial_transcribe(
-                                    current, initial_prompt=self._initial_prompt
+                                    partial_target, initial_prompt=self._initial_prompt
                                 )
                                 text = (partial.text if partial else "").strip()
                                 if text and text != last_partial_text:

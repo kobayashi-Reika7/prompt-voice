@@ -1,4 +1,4 @@
-"""Microphone audio capture module for Windows-friendly MVP."""
+"""Audio capture module with auto mic + system-audio mix."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class AudioCaptureError(RuntimeError):
 
 
 class AudioCapture:
-    """Continuously captures microphone audio and pushes AudioChunk to a queue."""
+    """Captures mic + system audio and pushes mixed AudioChunk to a queue."""
 
     def __init__(
         self,
@@ -32,27 +32,34 @@ class AudioCapture:
         channels: int = CHANNELS,
         block_size: int = BLOCK_SIZE,
         device: Optional[int | str] = None,
+        include_system_audio: bool = True,
         queue_maxsize: int = 256,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.block_size = block_size
         self.device = device
+        self.include_system_audio = include_system_audio
 
         self.chunk_queue: "queue.Queue[AudioChunk]" = queue.Queue(maxsize=queue_maxsize)
         self.error_queue: "queue.Queue[str]" = queue.Queue(maxsize=64)
 
-        self._stream: Optional[sd.InputStream] = None
+        self._mic_stream: Optional[sd.InputStream] = None
+        self._system_stream: Optional[sd.InputStream] = None
+        self._mixer_thread: Optional[threading.Thread] = None
         self._is_running = False
         self._lock = threading.Lock()
         self._counter = count(1)
+        self._frame_lock = threading.Lock()
+        self._latest_mic_frame: Optional[np.ndarray] = None
+        self._latest_system_frame: Optional[np.ndarray] = None
 
         self._level_lock = threading.Lock()
         self._last_level_ts: float = 0.0
         self._last_rms: float = 0.0
         self._last_peak: float = 0.0
 
-        self.source_type: str = "mic"  # future: "mic" | "system" | "unknown"
+        self.source_type: str = "unknown"
         self.selected_device: Optional[int | str] = self.device
         self.selected_device_info: Dict[str, Any] = {}
         self._discard_audio: bool = False
@@ -62,7 +69,7 @@ class AudioCapture:
         return self._is_running
 
     def start(self) -> None:
-        """Start microphone input stream (uses default input device when device=None)."""
+        """Start auto input streams (default mic + loopback speaker)."""
         with self._lock:
             if self._is_running:
                 return
@@ -72,33 +79,32 @@ class AudioCapture:
 
             try:
                 resolved_device = self._resolve_default_input_device(self.device)
-                self._start_stream(device=resolved_device)
                 self._is_running = True
+                self._start_mic_stream(device=resolved_device)
+                self._start_system_stream_if_available()
+                self._mixer_thread = threading.Thread(target=self._mixer_loop, daemon=True)
+                self._mixer_thread.start()
                 logger.info(
                     "Audio capture started. source=%s device=%s",
                     self.source_type,
-                    str(self.selected_device),
+                    str(self.selected_device_info.get("display_name", self.selected_device)),
                 )
             except Exception as exc:
-                self._stream = None
+                self._is_running = False
+                self._stop_streams()
                 raise AudioCaptureError(f"Failed to start audio stream: {exc}") from exc
 
     def stop(self) -> None:
-        """Stop microphone input stream safely."""
+        """Stop active streams safely."""
         with self._lock:
             if not self._is_running:
                 return
 
-            if self._stream is not None:
-                try:
-                    self._stream.stop()
-                    self._stream.close()
-                except Exception as exc:
-                    logger.warning("Error while stopping audio stream: %s", exc)
-                finally:
-                    self._stream = None
-
             self._is_running = False
+            self._stop_streams()
+            if self._mixer_thread is not None:
+                self._mixer_thread.join(timeout=2.0)
+                self._mixer_thread = None
             logger.info("Audio capture stopped.")
 
     def get_chunk(self, timeout: Optional[float] = None) -> Optional[AudioChunk]:
@@ -126,9 +132,13 @@ class AudioCapture:
 
     def get_active_device_name(self) -> str:
         """Return best-effort active device name for UI display."""
-        info = self.selected_device_info or self._query_device_safe(self.selected_device)
+        info = self.selected_device_info
+        display_name = info.get("display_name") if isinstance(info, dict) else None
+        if display_name:
+            return str(display_name)
+        info = self._query_device_safe(self.selected_device)
         name = info.get("name") if isinstance(info, dict) else None
-        return str(name) if name else "Default"
+        return str(name) if name else "Default (mic + system)"
 
     def run_self_test(self, duration_sec: float = 2.5) -> InputDiagnosticResult:
         """
@@ -155,73 +165,58 @@ class AudioCapture:
             try:
                 resolved_device = self._resolve_default_input_device(self.device)
                 self._discard_audio = True
-                self._start_stream(device=resolved_device)
+                self._is_running = True
+                self._start_mic_stream(device=resolved_device)
+                self._start_system_stream_if_available()
+                self._mixer_thread = threading.Thread(target=self._mixer_loop, daemon=True)
+                self._mixer_thread.start()
                 peak_max, avg_level = self._measure_levels(duration_sec=duration_sec)
                 return self._to_diagnostic(peak_max=peak_max, avg_level=avg_level)
             finally:
+                self._is_running = False
                 self._discard_audio = False
-                if self._stream is not None:
-                    try:
-                        self._stream.stop()
-                        self._stream.close()
-                    except Exception:
-                        pass
-                    finally:
-                        self._stream = None
-                self.selected_device = self.device
-                self.selected_device_info = self._query_device_safe(self.device)
+                self._stop_streams()
+                if self._mixer_thread is not None:
+                    self._mixer_thread.join(timeout=1.0)
+                    self._mixer_thread = None
 
-    def _audio_callback(
+    def _mic_callback(
         self,
         indata: np.ndarray,
         frames: int,
         stream_time: Any,  # sounddevice callback type placeholder
         status: sd.CallbackFlags,
     ) -> None:
-        """Sounddevice callback executed on audio thread."""
+        """Mic callback: store latest frame for mixer thread."""
         del stream_time
-
         if status:
-            self._push_error(f"Audio status warning: {status}")
-
+            self._push_error(f"Mic status warning: {status}")
+        if not self._is_running or frames <= 0:
+            return
         try:
-            if not self._is_running:
-                return
-
-            if frames <= 0:
-                return
-
-            # Ensure mono float32 data for downstream modules.
-            if indata.ndim == 2 and indata.shape[1] > 1:
-                mono = np.mean(indata, axis=1, dtype=np.float32)
-            else:
-                mono = np.asarray(indata).reshape(-1).astype(np.float32, copy=False)
-
-            # Update level meters (thread-safe, lightweight).
-            try:
-                peak = float(np.max(np.abs(mono))) if mono.size else 0.0
-                rms = float(np.sqrt(np.mean(np.square(mono), dtype=np.float32))) if mono.size else 0.0
-                with self._level_lock:
-                    self._last_level_ts = time.time()
-                    self._last_peak = peak
-                    self._last_rms = rms
-            except Exception:
-                pass
-
-            chunk = AudioChunk(
-                samples=mono,
-                sample_rate=self.sample_rate,
-                timestamp=time.time(),
-                sequence_id=next(self._counter),
-            )
-
-            try:
-                if not self._discard_audio:
-                    self.chunk_queue.put_nowait(chunk)
-            except queue.Full:
-                self._push_error("Audio chunk dropped: queue is full.")
+            with self._frame_lock:
+                self._latest_mic_frame = self._to_mono(indata)
         except Exception as exc:
-            self._push_error(f"Audio callback error: {exc}")
+            self._push_error(f"Mic callback error: {exc}")
+
+    def _system_callback(
+        self,
+        indata: np.ndarray,
+        frames: int,
+        stream_time: Any,
+        status: sd.CallbackFlags,
+    ) -> None:
+        """System callback: store latest frame for mixer thread."""
+        del stream_time
+        if status:
+            self._push_error(f"System status warning: {status}")
+        if not self._is_running or frames <= 0:
+            return
+        try:
+            with self._frame_lock:
+                self._latest_system_frame = self._to_mono(indata)
+        except Exception as exc:
+            self._push_error(f"System callback error: {exc}")
 
     def _push_error(self, message: str) -> None:
         logger.warning(message)
@@ -230,19 +225,117 @@ class AudioCapture:
         except queue.Full:
             pass
 
-    def _start_stream(self, *, device: Optional[int | str]) -> None:
-        self._stream = sd.InputStream(
+    def _start_mic_stream(self, *, device: Optional[int | str]) -> None:
+        self._mic_stream = sd.InputStream(
             samplerate=self.sample_rate,
             blocksize=self.block_size,
             channels=self.channels,
             dtype="float32",
             device=device,
-            callback=self._audio_callback,
+            callback=self._mic_callback,
         )
-        self._stream.start()
-        self.source_type = "mic"
+        self._mic_stream.start()
         self.selected_device = device
-        self.selected_device_info = self._query_device_safe(device)
+        self.source_type = "mic"
+        mic_name = self._query_device_safe(device).get("name", "Default Mic")
+        self.selected_device_info = {"mic_name": str(mic_name), "display_name": str(mic_name)}
+
+    def _start_system_stream_if_available(self) -> None:
+        if not self.include_system_audio:
+            return
+        loopback_device = self._resolve_loopback_device()
+        if loopback_device is None:
+            self._push_error("System loopback not available; continuing with mic only.")
+            return
+        try:
+            extra = sd.WasapiSettings(loopback=True)
+            self._system_stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                blocksize=self.block_size,
+                channels=self.channels,
+                dtype="float32",
+                device=loopback_device,
+                callback=self._system_callback,
+                extra_settings=extra,
+            )
+            self._system_stream.start()
+            sys_name = self._query_device_safe(loopback_device).get("name", "Default Speaker")
+            mic_name = str(self.selected_device_info.get("mic_name", "Default Mic"))
+            self.selected_device_info = {
+                "mic_name": mic_name,
+                "system_name": str(sys_name),
+                "display_name": f"{mic_name} + {sys_name}",
+            }
+            self.source_type = "mixed"
+        except Exception as exc:
+            self._system_stream = None
+            self._push_error(f"System loopback failed ({exc}); continuing with mic only.")
+
+    def _mixer_loop(self) -> None:
+        interval_sec = max(0.01, float(self.block_size) / float(self.sample_rate))
+        while self._is_running:
+            with self._frame_lock:
+                mic = None if self._latest_mic_frame is None else self._latest_mic_frame.copy()
+                system = None if self._latest_system_frame is None else self._latest_system_frame.copy()
+
+            if mic is None and system is None:
+                time.sleep(interval_sec)
+                continue
+
+            mixed = self._mix_frames(mic=mic, system=system)
+            if mixed.size == 0:
+                time.sleep(interval_sec)
+                continue
+
+            peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+            rms = float(np.sqrt(np.mean(np.square(mixed), dtype=np.float32))) if mixed.size else 0.0
+            with self._level_lock:
+                self._last_level_ts = time.time()
+                self._last_peak = peak
+                self._last_rms = rms
+
+            if not self._discard_audio:
+                chunk = AudioChunk(
+                    samples=mixed,
+                    sample_rate=self.sample_rate,
+                    timestamp=time.time(),
+                    sequence_id=next(self._counter),
+                )
+                try:
+                    self.chunk_queue.put_nowait(chunk)
+                except queue.Full:
+                    self._push_error("Audio chunk dropped: queue is full.")
+            time.sleep(interval_sec)
+
+    def _mix_frames(self, *, mic: Optional[np.ndarray], system: Optional[np.ndarray]) -> np.ndarray:
+        mic_arr = self._fit_frame(mic)
+        sys_arr = self._fit_frame(system)
+        if mic_arr is None and sys_arr is None:
+            return np.empty(0, dtype=np.float32)
+        if mic_arr is None:
+            return sys_arr.astype(np.float32, copy=False)  # type: ignore[union-attr]
+        if sys_arr is None:
+            return mic_arr.astype(np.float32, copy=False)
+        mixed = (mic_arr + sys_arr) * 0.5
+        return np.clip(mixed, -1.0, 1.0).astype(np.float32, copy=False)
+
+    def _fit_frame(self, frame: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if frame is None:
+            return None
+        arr = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if arr.size == self.block_size:
+            return arr
+        if arr.size > self.block_size:
+            return arr[: self.block_size]
+        padded = np.zeros(self.block_size, dtype=np.float32)
+        padded[: arr.size] = arr
+        return padded
+
+    @staticmethod
+    def _to_mono(indata: np.ndarray) -> np.ndarray:
+        if indata.ndim == 2 and indata.shape[1] > 1:
+            return np.mean(indata, axis=1, dtype=np.float32)
+        return np.asarray(indata).reshape(-1).astype(np.float32, copy=False)
 
     def _measure_levels(self, *, duration_sec: float) -> tuple[float, float]:
         start = time.time()
@@ -262,14 +355,14 @@ class AudioCapture:
         if not has_signal:
             note = (
                 "音が入っていません。Windowsのマイク権限、既定の入力デバイス、ミュート状態を確認してください。"
-                "会議相手の音声は通常スピーカー出力なので、マイク入力だけでは拾えない場合があります。"
+                "内部音が必要な場合は、Windowsでアプリの音量出力先が既定スピーカーになっているか確認してください。"
             )
         return InputDiagnosticResult(
             has_signal=has_signal,
             avg_level=float(avg_level),
             peak_level=float(peak_max),
             device_name=device_name,
-            source_type="mic",
+            source_type=self.source_type if self.source_type in ("mic", "system", "mixed") else "unknown",
             note=note,
         )
 
@@ -287,6 +380,26 @@ class AudioCapture:
         # but fall back to PortAudio default by returning None.
         idx = get_default_input_device_index()
         return idx if idx is not None else None
+
+    @staticmethod
+    def _resolve_loopback_device() -> Optional[int]:
+        output_idx = get_default_output_device_index()
+        return output_idx if output_idx is not None else None
+
+    def _stop_streams(self) -> None:
+        for stream in (self._system_stream, self._mic_stream):
+            if stream is None:
+                continue
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as exc:
+                logger.warning("Error while stopping audio stream: %s", exc)
+        self._system_stream = None
+        self._mic_stream = None
+        with self._frame_lock:
+            self._latest_mic_frame = None
+            self._latest_system_frame = None
 
     @staticmethod
     def _query_device_safe(device: Optional[int | str]) -> Dict[str, Any]:
@@ -322,8 +435,12 @@ def get_default_input_device_index() -> Optional[int]:
         if default is None:
             return None
         if isinstance(default, (list, tuple)):
-            return int(default[0]) if len(default) > 0 and default[0] is not None else None
-        return int(default)
+            if len(default) == 0 or default[0] is None:
+                return None
+            idx = int(default[0])
+            return idx if idx >= 0 else None
+        idx = int(default)
+        return idx if idx >= 0 else None
     except Exception:
         return None
 
@@ -335,8 +452,12 @@ def get_default_output_device_index() -> Optional[int]:
         if default is None:
             return None
         if isinstance(default, (list, tuple)):
-            return int(default[1]) if len(default) > 1 and default[1] is not None else None
-        return int(default)
+            if len(default) <= 1 or default[1] is None:
+                return None
+            idx = int(default[1])
+            return idx if idx >= 0 else None
+        idx = int(default)
+        return idx if idx >= 0 else None
     except Exception:
         return None
 
